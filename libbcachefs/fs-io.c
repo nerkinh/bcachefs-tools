@@ -99,8 +99,7 @@ static int write_invalidate_inode_pages_range(struct address_space *mapping,
 	 * is continually redirtying a specific page
 	 */
 	do {
-		if (!mapping->nrpages &&
-		    !mapping->nrexceptional)
+		if (!mapping->nrpages)
 			return 0;
 
 		ret = filemap_write_and_wait_range(mapping, start, end);
@@ -892,7 +891,7 @@ void bch2_readahead(struct readahead_control *ractl)
 		unsigned n = min_t(unsigned,
 				   readpages_iter.nr_pages -
 				   readpages_iter.idx,
-				   BIO_MAX_PAGES);
+				   BIO_MAX_VECS);
 		struct bch_read_bio *rbio =
 			rbio_init(bio_alloc_bioset(GFP_NOFS, n, &c->bio_read),
 				  opts);
@@ -1095,8 +1094,7 @@ static void bch2_writepage_io_alloc(struct bch_fs *c,
 {
 	struct bch_write_op *op;
 
-	w->io = container_of(bio_alloc_bioset(GFP_NOFS,
-					      BIO_MAX_PAGES,
+	w->io = container_of(bio_alloc_bioset(GFP_NOFS, BIO_MAX_VECS,
 					      &c->writepage_bioset),
 			     struct bch_writepage_io, op.wbio.bio);
 
@@ -1219,7 +1217,7 @@ do_io:
 		    (w->io->op.res.nr_replicas != nr_replicas_this_write ||
 		     bio_full(&w->io->op.wbio.bio, PAGE_SIZE) ||
 		     w->io->op.wbio.bio.bi_iter.bi_size + (sectors << 9) >=
-		     (BIO_MAX_PAGES * PAGE_SIZE) ||
+		     (BIO_MAX_VECS * PAGE_SIZE) ||
 		     bio_end_sector(&w->io->op.wbio.bio) != sector))
 			bch2_writepage_do_io(w);
 
@@ -1488,8 +1486,8 @@ retry_reservation:
 		unsigned pg_offset = (offset + copied) & (PAGE_SIZE - 1);
 		unsigned pg_len = min_t(unsigned, len - copied,
 					PAGE_SIZE - pg_offset);
-		unsigned pg_copied = iov_iter_copy_from_user_atomic(page,
-						iter, pg_offset, pg_len);
+		unsigned pg_copied = copy_page_from_iter_atomic(page,
+						pg_offset, pg_len,iter);
 
 		if (!pg_copied)
 			break;
@@ -1502,7 +1500,6 @@ retry_reservation:
 		}
 
 		flush_dcache_page(page);
-		iov_iter_advance(iter, pg_copied);
 		copied += pg_copied;
 
 		if (pg_copied != pg_len)
@@ -1683,7 +1680,7 @@ static int bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter)
 	iter->count -= shorten;
 
 	bio = bio_alloc_bioset(GFP_KERNEL,
-			       iov_iter_npages(iter, BIO_MAX_PAGES),
+			       iov_iter_npages(iter, BIO_MAX_VECS),
 			       &c->dio_read_bioset);
 
 	bio->bi_end_io = bch2_direct_IO_read_endio;
@@ -1718,7 +1715,7 @@ static int bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter)
 	goto start;
 	while (iter->count) {
 		bio = bio_alloc_bioset(GFP_KERNEL,
-				       iov_iter_npages(iter, BIO_MAX_PAGES),
+				       iov_iter_npages(iter, BIO_MAX_VECS),
 				       &c->bio_read);
 		bio->bi_end_io		= bch2_direct_IO_read_split_endio;
 start:
@@ -2017,7 +2014,7 @@ ssize_t bch2_direct_write(struct kiocb *req, struct iov_iter *iter)
 	}
 
 	bio = bio_alloc_bioset(GFP_KERNEL,
-			       iov_iter_npages(iter, BIO_MAX_PAGES),
+			       iov_iter_npages(iter, BIO_MAX_VECS),
 			       &c->dio_write_bioset);
 	dio = container_of(bio, struct dio_write, op.wbio.bio);
 	init_completion(&dio->done);
@@ -2258,7 +2255,8 @@ static int bch2_extend(struct bch_inode_info *inode,
 		return ret;
 
 	truncate_setsize(&inode->v, iattr->ia_size);
-	setattr_copy(&inode->v, iattr);
+	/* ATTR_MODE will never be set here, ns argument isn't needed: */
+	setattr_copy(NULL, &inode->v, iattr);
 
 	mutex_lock(&inode->ei_update_lock);
 	ret = bch2_write_inode_size(c, inode, inode->v.i_size,
@@ -2375,7 +2373,8 @@ int bch2_truncate(struct bch_inode_info *inode, struct iattr *iattr)
 	if (unlikely(ret))
 		goto err;
 
-	setattr_copy(&inode->v, iattr);
+	/* ATTR_MODE will never be set here, ns argument isn't needed: */
+	setattr_copy(NULL, &inode->v, iattr);
 
 	mutex_lock(&inode->ei_update_lock);
 	ret = bch2_write_inode(c, inode, bch2_truncate_finish_fn, NULL,

@@ -6,7 +6,7 @@
 #include <linux/kobject.h>
 #include <linux/types.h>
 
-#define BIO_MAX_PAGES	256
+#define BIO_MAX_VECS	256U
 
 typedef unsigned fmode_t;
 
@@ -59,35 +59,7 @@ static inline struct inode *file_inode(const struct file *f)
 	return f->f_inode;
 }
 
-#define BDEVNAME_SIZE	32
-
-struct request_queue {
-	struct backing_dev_info *backing_dev_info;
-};
-
-struct gendisk {
-};
-
-struct hd_struct {
-	struct kobject		kobj;
-};
-
 #define part_to_dev(part)	(part)
-
-struct block_device {
-	char			name[BDEVNAME_SIZE];
-	struct inode		*bd_inode;
-	struct request_queue	queue;
-	void			*bd_holder;
-	struct hd_struct	*bd_part;
-	struct gendisk		*bd_disk;
-	struct gendisk		__bd_disk;
-	int			bd_fd;
-	int			bd_sync_fd;
-
-	struct backing_dev_info	*bd_bdi;
-	struct backing_dev_info	__bd_bdi;
-};
 
 void generic_make_request(struct bio *);
 int submit_bio_wait(struct bio *);
@@ -102,6 +74,17 @@ int blkdev_issue_discard(struct block_device *, sector_t,
 
 #define bdev_get_queue(bdev)		(&((bdev)->queue))
 
+#ifndef SECTOR_SHIFT
+#define SECTOR_SHIFT 9
+#endif
+#ifndef SECTOR_SIZE
+#define SECTOR_SIZE (1 << SECTOR_SHIFT)
+#endif
+
+#define PAGE_SECTORS_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
+#define PAGE_SECTORS		(1 << PAGE_SECTORS_SHIFT)
+#define SECTOR_MASK		(PAGE_SECTORS - 1)
+
 #define blk_queue_discard(q)		((void) (q), 0)
 #define blk_queue_nonrot(q)		((void) (q), 0)
 
@@ -111,7 +94,7 @@ sector_t get_capacity(struct gendisk *disk);
 void blkdev_put(struct block_device *bdev, fmode_t mode);
 void bdput(struct block_device *bdev);
 struct block_device *blkdev_get_by_path(const char *path, fmode_t mode, void *holder);
-struct block_device *lookup_bdev(const char *path);
+int lookup_bdev(const char *path, dev_t *);
 
 struct super_block {
 	void			*s_fs_info;
@@ -133,6 +116,7 @@ struct super_block {
 #define DT_LNK		10
 #define DT_SOCK		12
 #define DT_WHT		14
+#define DT_MAX		16
 #endif
 
 /*

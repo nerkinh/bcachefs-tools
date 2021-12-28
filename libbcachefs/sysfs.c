@@ -188,7 +188,7 @@ rw_attribute(cache_replacement_policy);
 rw_attribute(label);
 
 rw_attribute(copy_gc_enabled);
-sysfs_pd_controller_attribute(copy_gc);
+read_attribute(copy_gc_wait);
 
 rw_attribute(rebalance_enabled);
 sysfs_pd_controller_attribute(rebalance);
@@ -196,8 +196,6 @@ read_attribute(rebalance_work);
 rw_attribute(promote_whole_extents);
 
 read_attribute(new_stripes);
-
-rw_attribute(pd_controllers_update_seconds);
 
 read_attribute(io_timers_read);
 read_attribute(io_timers_write);
@@ -330,12 +328,11 @@ SHOW(bch2_fs)
 
 	sysfs_printf(copy_gc_enabled, "%i", c->copy_gc_enabled);
 
-	sysfs_print(pd_controllers_update_seconds,
-		    c->pd_controllers_update_seconds);
-
 	sysfs_printf(rebalance_enabled,		"%i", c->rebalance.enabled);
 	sysfs_pd_controller_show(rebalance,	&c->rebalance.pd); /* XXX */
-	sysfs_pd_controller_show(copy_gc,	&c->copygc_pd);
+	sysfs_hprint(copy_gc_wait,
+		     max(0LL, c->copygc_wait -
+			 atomic64_read(&c->io_clock[WRITE].now)) << 9);
 
 	if (attr == &sysfs_rebalance_work) {
 		bch2_rebalance_work_to_text(&out, c);
@@ -443,10 +440,7 @@ STORE(bch2_fs)
 		return ret;
 	}
 
-	sysfs_strtoul(pd_controllers_update_seconds,
-		      c->pd_controllers_update_seconds);
 	sysfs_pd_controller_store(rebalance,	&c->rebalance.pd);
-	sysfs_pd_controller_store(copy_gc,	&c->copygc_pd);
 
 	sysfs_strtoul(promote_whole_extents,	c->promote_whole_extents);
 
@@ -563,11 +557,11 @@ struct attribute *bch2_fs_internal_files[] = {
 	&sysfs_prune_cache,
 
 	&sysfs_copy_gc_enabled,
+	&sysfs_copy_gc_wait,
 
 	&sysfs_rebalance_enabled,
 	&sysfs_rebalance_work,
 	sysfs_pd_controller_files(rebalance),
-	sysfs_pd_controller_files(copy_gc),
 
 	&sysfs_new_stripes,
 
@@ -806,11 +800,14 @@ static void dev_alloc_debug_to_text(struct printbuf *out, struct bch_dev *ca)
 	       "free[RESERVE_MOVINGGC]\t%zu/%zu\n"
 	       "free[RESERVE_NONE]\t%zu/%zu\n"
 	       "freelist_wait\t\t%s\n"
-	       "open buckets\t\t%u/%u (reserved %u)\n"
+	       "open buckets allocated\t%u\n"
+	       "open buckets this dev\t%u\n"
+	       "open buckets total\t%u\n"
 	       "open_buckets_wait\t%s\n"
 	       "open_buckets_btree\t%u\n"
 	       "open_buckets_user\t%u\n"
-	       "btree reserve cache\t%u\n",
+	       "btree reserve cache\t%u\n"
+	       "thread state:\t\t%s\n",
 	       stats.buckets_ec,
 	       __dev_buckets_available(ca, stats),
 	       stats.buckets_alloc,
@@ -818,12 +815,14 @@ static void dev_alloc_debug_to_text(struct printbuf *out, struct bch_dev *ca)
 	       fifo_used(&ca->free[RESERVE_MOVINGGC]),	ca->free[RESERVE_MOVINGGC].size,
 	       fifo_used(&ca->free[RESERVE_NONE]),	ca->free[RESERVE_NONE].size,
 	       c->freelist_wait.list.first		? "waiting" : "empty",
-	       c->open_buckets_nr_free, OPEN_BUCKETS_COUNT,
-	       BTREE_NODE_OPEN_BUCKET_RESERVE,
+	       OPEN_BUCKETS_COUNT - c->open_buckets_nr_free,
+	       ca->nr_open_buckets,
+	       OPEN_BUCKETS_COUNT,
 	       c->open_buckets_wait.list.first		? "waiting" : "empty",
 	       nr[BCH_DATA_btree],
 	       nr[BCH_DATA_user],
-	       c->btree_reserve_cache_nr);
+	       c->btree_reserve_cache_nr,
+	       bch2_allocator_states[ca->allocator_state]);
 }
 
 static const char * const bch2_rw[] = {

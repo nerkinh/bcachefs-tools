@@ -179,6 +179,7 @@
 #undef pr_fmt
 #define pr_fmt(fmt) "bcachefs: %s() " fmt "\n", __func__
 
+#include <linux/backing-dev-defs.h>
 #include <linux/bug.h>
 #include <linux/bio.h>
 #include <linux/closure.h>
@@ -447,6 +448,7 @@ struct bch_dev {
 	 */
 	alloc_fifo		free[RESERVE_NR];
 	alloc_fifo		free_inc;
+	unsigned		nr_open_buckets;
 
 	open_bucket_idx_t	open_buckets_partial[OPEN_BUCKETS_COUNT];
 	open_bucket_idx_t	open_buckets_partial_nr;
@@ -456,16 +458,7 @@ struct bch_dev {
 	size_t			inc_gen_needs_gc;
 	size_t			inc_gen_really_needs_gc;
 
-	/*
-	 * XXX: this should be an enum for allocator state, so as to include
-	 * error state
-	 */
-	enum {
-		ALLOCATOR_STOPPED,
-		ALLOCATOR_RUNNING,
-		ALLOCATOR_BLOCKED,
-		ALLOCATOR_BLOCKED_FULL,
-	}			allocator_state;
+	enum allocator_states	allocator_state;
 
 	alloc_heap		alloc_heap;
 
@@ -663,9 +656,6 @@ struct bch_fs {
 	struct workqueue_struct	*copygc_wq;
 
 	/* ALLOCATION */
-	struct delayed_work	pd_controllers_update;
-	unsigned		pd_controllers_update_seconds;
-
 	struct bch_devs_mask	rw_devs[BCH_DATA_NR];
 
 	u64			capacity; /* sectors */
@@ -770,9 +760,8 @@ struct bch_fs {
 	/* COPYGC */
 	struct task_struct	*copygc_thread;
 	copygc_heap		copygc_heap;
-	struct bch_pd_controller copygc_pd;
 	struct write_point	copygc_write_point;
-	u64			copygc_threshold;
+	s64			copygc_wait;
 
 	/* STRIPES: */
 	GENRADIX(struct stripe) stripes[2];

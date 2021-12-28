@@ -25,43 +25,18 @@
 #include <linux/sort.h>
 #include <trace/events/bcachefs.h>
 
+const char * const bch2_allocator_states[] = {
+#define x(n)	#n,
+	ALLOC_THREAD_STATES()
+#undef x
+	NULL
+};
+
 static const unsigned BCH_ALLOC_V1_FIELD_BYTES[] = {
 #define x(name, bits) [BCH_ALLOC_FIELD_V1_##name] = bits / 8,
 	BCH_ALLOC_FIELDS_V1()
 #undef x
 };
-
-/* Ratelimiting/PD controllers */
-
-static void pd_controllers_update(struct work_struct *work)
-{
-	struct bch_fs *c = container_of(to_delayed_work(work),
-					   struct bch_fs,
-					   pd_controllers_update);
-	struct bch_dev *ca;
-	s64 free = 0, fragmented = 0;
-	unsigned i;
-
-	for_each_member_device(ca, c, i) {
-		struct bch_dev_usage stats = bch2_dev_usage_read(ca);
-
-		free += bucket_to_sector(ca,
-				__dev_buckets_free(ca, stats)) << 9;
-		/*
-		 * Bytes of internal fragmentation, which can be
-		 * reclaimed by copy GC
-		 */
-		fragmented += max_t(s64, 0, (bucket_to_sector(ca,
-					stats.d[BCH_DATA_user].buckets +
-					stats.d[BCH_DATA_cached].buckets) -
-				  (stats.d[BCH_DATA_user].sectors +
-				   stats.d[BCH_DATA_cached].sectors)) << 9);
-	}
-
-	bch2_pd_controller_update(&c->copygc_pd, free, fragmented, -1);
-	schedule_delayed_work(&c->pd_controllers_update,
-			      c->pd_controllers_update_seconds * HZ);
-}
 
 /* Persistent alloc info: */
 
@@ -499,10 +474,9 @@ static int wait_buckets_available(struct bch_fs *c, struct bch_dev *ca)
 {
 	unsigned long gc_count = c->gc_count;
 	s64 available;
-	unsigned i;
 	int ret = 0;
 
-	ca->allocator_state = ALLOCATOR_BLOCKED;
+	ca->allocator_state = ALLOCATOR_blocked;
 	closure_wake_up(&c->freelist_wait);
 
 	while (1) {
@@ -515,19 +489,12 @@ static int wait_buckets_available(struct bch_fs *c, struct bch_dev *ca)
 		if (gc_count != c->gc_count)
 			ca->inc_gen_really_needs_gc = 0;
 
-		available  = dev_buckets_available(ca);
+		available  = dev_buckets_reclaimable(ca);
 		available -= ca->inc_gen_really_needs_gc;
-
-		spin_lock(&c->freelist_lock);
-		for (i = 0; i < RESERVE_NR; i++)
-			available -= fifo_used(&ca->free[i]);
-		spin_unlock(&c->freelist_lock);
 
 		available = max(available, 0LL);
 
-		if (available > fifo_free(&ca->free_inc) ||
-		    (available &&
-		     !fifo_full(&ca->free[RESERVE_MOVINGGC])))
+		if (available)
 			break;
 
 		up_read(&c->gc_lock);
@@ -537,7 +504,7 @@ static int wait_buckets_available(struct bch_fs *c, struct bch_dev *ca)
 	}
 
 	__set_current_state(TASK_RUNNING);
-	ca->allocator_state = ALLOCATOR_RUNNING;
+	ca->allocator_state = ALLOCATOR_running;
 	closure_wake_up(&c->freelist_wait);
 
 	return ret;
@@ -1018,15 +985,15 @@ static int push_invalidated_bucket(struct bch_fs *c, struct bch_dev *ca, size_t 
 				fifo_pop(&ca->free_inc, bucket);
 
 				closure_wake_up(&c->freelist_wait);
-				ca->allocator_state = ALLOCATOR_RUNNING;
+				ca->allocator_state = ALLOCATOR_running;
 
 				spin_unlock(&c->freelist_lock);
 				goto out;
 			}
 		}
 
-		if (ca->allocator_state != ALLOCATOR_BLOCKED_FULL) {
-			ca->allocator_state = ALLOCATOR_BLOCKED_FULL;
+		if (ca->allocator_state != ALLOCATOR_blocked_full) {
+			ca->allocator_state = ALLOCATOR_blocked_full;
 			closure_wake_up(&c->freelist_wait);
 		}
 
@@ -1093,12 +1060,12 @@ static int bch2_allocator_thread(void *arg)
 
 	while (1) {
 		if (!allocator_thread_running(ca)) {
-			ca->allocator_state = ALLOCATOR_STOPPED;
+			ca->allocator_state = ALLOCATOR_stopped;
 			if (kthread_wait_freezable(allocator_thread_running(ca)))
 				break;
 		}
 
-		ca->allocator_state = ALLOCATOR_RUNNING;
+		ca->allocator_state = ALLOCATOR_running;
 
 		cond_resched();
 		if (kthread_should_stop())
@@ -1179,7 +1146,7 @@ static int bch2_allocator_thread(void *arg)
 
 stop:
 	pr_debug("alloc thread stopping (ret %i)", ret);
-	ca->allocator_state = ALLOCATOR_STOPPED;
+	ca->allocator_state = ALLOCATOR_stopped;
 	closure_wake_up(&c->freelist_wait);
 	return 0;
 }
@@ -1189,7 +1156,7 @@ stop:
 void bch2_recalc_capacity(struct bch_fs *c)
 {
 	struct bch_dev *ca;
-	u64 capacity = 0, reserved_sectors = 0, gc_reserve, copygc_threshold = 0;
+	u64 capacity = 0, reserved_sectors = 0, gc_reserve;
 	unsigned bucket_size_max = 0;
 	unsigned long ra_pages = 0;
 	unsigned i, j;
@@ -1197,7 +1164,7 @@ void bch2_recalc_capacity(struct bch_fs *c)
 	lockdep_assert_held(&c->state_lock);
 
 	for_each_online_member(ca, c, i) {
-		struct backing_dev_info *bdi = ca->disk_sb.bdev->bd_bdi;
+		struct backing_dev_info *bdi = ca->disk_sb.bdev->bd_disk->bdi;
 
 		ra_pages += bdi->ra_pages;
 	}
@@ -1232,8 +1199,6 @@ void bch2_recalc_capacity(struct bch_fs *c)
 
 		dev_reserve *= ca->mi.bucket_size;
 
-		copygc_threshold += dev_reserve;
-
 		capacity += bucket_to_sector(ca, ca->mi.nbuckets -
 					     ca->mi.first_bucket);
 
@@ -1251,7 +1216,6 @@ void bch2_recalc_capacity(struct bch_fs *c)
 
 	reserved_sectors = min(reserved_sectors, capacity);
 
-	c->copygc_threshold = copygc_threshold;
 	c->capacity = capacity - reserved_sectors;
 
 	c->bucket_size_max = bucket_size_max;
@@ -1362,7 +1326,7 @@ void bch2_dev_allocator_quiesce(struct bch_fs *c, struct bch_dev *ca)
 {
 	if (ca->alloc_thread)
 		closure_wait_event(&c->freelist_wait,
-				   ca->allocator_state != ALLOCATOR_RUNNING);
+				   ca->allocator_state != ALLOCATOR_running);
 }
 
 /* stop allocator thread: */
@@ -1416,7 +1380,4 @@ int bch2_dev_allocator_start(struct bch_dev *ca)
 void bch2_fs_allocator_background_init(struct bch_fs *c)
 {
 	spin_lock_init(&c->freelist_lock);
-
-	c->pd_controllers_update_seconds = 5;
-	INIT_DELAYED_WORK(&c->pd_controllers_update, pd_controllers_update);
 }

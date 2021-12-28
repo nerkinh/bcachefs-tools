@@ -99,7 +99,7 @@ static int bch2_dev_alloc(struct bch_fs *, unsigned);
 static int bch2_dev_sysfs_online(struct bch_fs *, struct bch_dev *);
 static void __bch2_dev_read_only(struct bch_fs *, struct bch_dev *);
 
-struct bch_fs *bch2_bdev_to_fs(struct block_device *bdev)
+struct bch_fs *bch2_dev_to_fs(dev_t dev)
 {
 	struct bch_fs *c;
 	struct bch_dev *ca;
@@ -110,7 +110,7 @@ struct bch_fs *bch2_bdev_to_fs(struct block_device *bdev)
 
 	list_for_each_entry(c, &bch_fs_list, list)
 		for_each_member_device_rcu(ca, c, i, NULL)
-			if (ca->disk_sb.bdev == bdev) {
+			if (ca->disk_sb.bdev->bd_dev == dev) {
 				closure_get(&c->cl);
 				goto found;
 			}
@@ -269,7 +269,7 @@ static void bch2_writes_disabled(struct percpu_ref *writes)
 void bch2_fs_read_only(struct bch_fs *c)
 {
 	if (!test_bit(BCH_FS_RW, &c->flags)) {
-		BUG_ON(c->journal.reclaim_thread);
+		bch2_journal_reclaim_stop(&c->journal);
 		return;
 	}
 
@@ -286,7 +286,6 @@ void bch2_fs_read_only(struct bch_fs *c)
 	percpu_ref_kill(&c->writes);
 
 	cancel_work_sync(&c->ec_stripe_delete_work);
-	cancel_delayed_work(&c->pd_controllers_update);
 
 	/*
 	 * If we're not doing an emergency shutdown, we want to wait on
@@ -371,8 +370,6 @@ static int bch2_fs_read_write_late(struct bch_fs *c)
 		return ret;
 	}
 
-	schedule_delayed_work(&c->pd_controllers_update, 5 * HZ);
-
 	schedule_work(&c->ec_stripe_delete_work);
 
 	return 0;
@@ -426,12 +423,6 @@ static int __bch2_fs_read_write(struct bch_fs *c, bool early)
 
 	for_each_rw_member(ca, c, i)
 		bch2_wake_allocator(ca);
-
-	ret = bch2_journal_reclaim_start(&c->journal);
-	if (ret) {
-		bch_err(c, "error starting journal reclaim: %i", ret);
-		return ret;
-	}
 
 	if (!early) {
 		ret = bch2_fs_read_write_late(c);
@@ -544,8 +535,7 @@ void __bch2_fs_stop(struct bch_fs *c)
 	for_each_member_device(ca, c, i)
 		if (ca->kobj.state_in_sysfs &&
 		    ca->disk_sb.bdev)
-			sysfs_remove_link(&part_to_dev(ca->disk_sb.bdev->bd_part)->kobj,
-					  "bcachefs");
+			sysfs_remove_link(bdev_kobj(ca->disk_sb.bdev), "bcachefs");
 
 	if (c->kobj.state_in_sysfs)
 		kobject_del(&c->kobj);
@@ -564,7 +554,6 @@ void __bch2_fs_stop(struct bch_fs *c)
 		cancel_work_sync(&ca->io_error_work);
 
 	cancel_work_sync(&c->btree_write_error_work);
-	cancel_delayed_work_sync(&c->pd_controllers_update);
 	cancel_work_sync(&c->read_only_work);
 
 	for (i = 0; i < c->sb.nr_devices; i++)
@@ -905,9 +894,16 @@ int bch2_fs_start(struct bch_fs *c)
 	/*
 	 * Allocator threads don't start filling copygc reserve until after we
 	 * set BCH_FS_STARTED - wake them now:
+	 *
+	 * XXX ugly hack:
+	 * Need to set ca->allocator_state here instead of relying on the
+	 * allocator threads to do it to avoid racing with the copygc threads
+	 * checking it and thinking they have no alloc reserve:
 	 */
-	for_each_online_member(ca, c, i)
+	for_each_online_member(ca, c, i) {
+		ca->allocator_state = ALLOCATOR_running;
 		bch2_wake_allocator(ca);
+	}
 
 	if (c->opts.read_only || c->opts.nochanges) {
 		bch2_fs_read_only(c);
@@ -1010,8 +1006,7 @@ static void bch2_dev_free(struct bch_dev *ca)
 
 	if (ca->kobj.state_in_sysfs &&
 	    ca->disk_sb.bdev)
-		sysfs_remove_link(&part_to_dev(ca->disk_sb.bdev->bd_part)->kobj,
-				  "bcachefs");
+		sysfs_remove_link(bdev_kobj(ca->disk_sb.bdev), "bcachefs");
 
 	if (ca->kobj.state_in_sysfs)
 		kobject_del(&ca->kobj);
@@ -1047,10 +1042,7 @@ static void __bch2_dev_offline(struct bch_fs *c, struct bch_dev *ca)
 	wait_for_completion(&ca->io_ref_completion);
 
 	if (ca->kobj.state_in_sysfs) {
-		struct kobject *block =
-			&part_to_dev(ca->disk_sb.bdev->bd_part)->kobj;
-
-		sysfs_remove_link(block, "bcachefs");
+		sysfs_remove_link(bdev_kobj(ca->disk_sb.bdev), "bcachefs");
 		sysfs_remove_link(&ca->kobj, "block");
 	}
 
@@ -1087,12 +1079,12 @@ static int bch2_dev_sysfs_online(struct bch_fs *c, struct bch_dev *ca)
 	}
 
 	if (ca->disk_sb.bdev) {
-		struct kobject *block =
-			&part_to_dev(ca->disk_sb.bdev->bd_part)->kobj;
+		struct kobject *block = bdev_kobj(ca->disk_sb.bdev);
 
 		ret = sysfs_create_link(block, &ca->kobj, "bcachefs");
 		if (ret)
 			return ret;
+
 		ret = sysfs_create_link(&ca->kobj, block, "block");
 		if (ret)
 			return ret;
@@ -1830,20 +1822,21 @@ err:
 /* return with ref on ca->ref: */
 struct bch_dev *bch2_dev_lookup(struct bch_fs *c, const char *path)
 {
-	struct block_device *bdev = lookup_bdev(path);
 	struct bch_dev *ca;
+	dev_t dev;
 	unsigned i;
+	int ret;
 
-	if (IS_ERR(bdev))
-		return ERR_CAST(bdev);
+	ret = lookup_bdev(path, &dev);
+	if (ret)
+		return ERR_PTR(ret);
 
 	for_each_member_device(ca, c, i)
-		if (ca->disk_sb.bdev == bdev)
+		if (ca->disk_sb.bdev->bd_dev == dev)
 			goto found;
 
 	ca = ERR_PTR(-ENOENT);
 found:
-	bdput(bdev);
 	return ca;
 }
 
