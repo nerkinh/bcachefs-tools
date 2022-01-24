@@ -119,7 +119,7 @@ int cmd_device_add(int argc, char *argv[])
 	struct bch_opts fs_opts = bch2_parse_opts(fs_opt_strs);
 
 	opt_set(fs_opts, block_size,
-		read_file_u64(fs.sysfs_fd, "options/block_size"));
+		read_file_u64(fs.sysfs_fd, "block_size"));
 	opt_set(fs_opts, btree_node_size,
 		read_file_u64(fs.sysfs_fd, "options/btree_node_size"));
 
